@@ -1,0 +1,79 @@
+Here's a clean way to frame this as an interview story — it's actually a good one because it involves multiple layers of debugging (networking → application logic → LLM performance), which shows systematic troubleshooting rather than guessing.
+
+## The problem
+Built an AI voice agent (Telnyx + LangGraph + Groq) that auto-calls borrowers about payments due. Calls were connecting successfully — Telnyx would dial, the person would answer — but the agent never spoke. From the outside it looked like a "broken AI," but the AI wasn't even being invoked.
+
+## Root cause #1: Webhook delivery, not the AI
+Telnyx's Call Control API is event-driven — it doesn't stream audio to your server directly. Instead, when the phone is answered, Telnyx sends a `call.answered` **webhook** to a URL you register, and only then does your server tell Telnyx to speak. So the entire conversation depends on Telnyx being able to reach your server over the public internet.
+
+I was tunneling my local FastAPI server through ngrok. Debugging systematically:
+- Checked my own server logs — nothing arrived on `call.answered` at all.
+- Checked Telnyx's own webhook delivery dashboard (not just my code) — it showed the *exact* failure: `ERR_NGROK_3200`, tunnel offline.
+
+That reframed the whole problem: it wasn't a code bug, it was infrastructure — the tunnel wasn't reliably up when calls landed (closed terminal, VS Code vs cmd having separate ngrok auth contexts, etc.).
+
+**Fix:** got the tunnel stably running, verified end-to-end with a manual `curl`/Postman POST to my own webhook URL before ever placing a real call again — turning "does it work?" into a testable step instead of a guess.
+
+## Root cause #2: My webhook handler was too slow, causing Telnyx to retry
+Once the tunnel was solid, a new failure appeared in Telnyx's delivery logs: `No Response` timeouts, then eventual `200` on a retry. The reason: my webhook handler was doing all its real work — calling my LLM (Groq) for the reply, then calling Telnyx's own API to speak it — *before* returning an HTTP response. If that whole chain took longer than Telnyx's webhook timeout, Telnyx assumed delivery failed and retried the same event, which could even double-trigger the greeting.
+
+**Fix:** classic webhook design pattern — **ack immediately, do the work asynchronously.** Split the handler so it returns `{"received": true}` right away, and moved the actual LLM call + Telnyx API calls into a FastAPI background task. Also added an idempotency guard so a retried event can't fire the greeting twice.
+
+## Root cause #3: The LLM itself was too slow for real-time voice
+Even with instant webhook acks, logs showed the greeting still took ~16 seconds to generate — long enough that the borrower hung up from silence before the agent said a word. Traced it to the LLM config: I was using a reasoning model (`gpt-oss-120b`) with `reasoning_effort="medium"` and `max_tokens=2048` — it was generating a lot of hidden "thinking" tokens before ever producing the one-sentence reply. Fine for a chat app; fatal for a phone call where silence past a couple seconds reads as "the call dropped."
+
+**Fix:** two-pronged — lowered reasoning effort and max tokens for faster replies generally, and (more importantly) made the *opening greeting* a templated string with zero LLM/network dependency, since that's the single moment on the call least tolerant of any latency. The LLM only takes over once the borrower starts actually talking, where a short thinking-pause is natural.
+
+## The interview-worthy takeaway
+The framing that lands well: *"The symptom was one thing — 'agent isn't speaking' — but there were three independent layers of failure stacked on top of each other: network reachability, webhook response-time semantics, and LLM latency budget for a real-time medium. Each one only became visible once the previous one was fixed, which is why I leaned on the provider's own delivery/debug logs (Telnyx's webhook inspector) instead of just guessing from my own app logs — that's what let me see the exact error code and timing at each layer instead of debugging blind."*
+
+That's a good structure for behavioral/system-design interview questions like "tell me about a hard bug you debugged" — it shows layered root-causing, not just a lucky fix.
+
+
+
+solution
+- **Diagnosed via logs, not guesswork** — Telnyx's webhook delivery logs showed `No Response`/timeout errors, and the app's own logs showed the Groq LLM call taking ~16 seconds before the agent could speak — long enough that the borrower hung up first.
+
+- **Ack the webhook immediately, do the real work in the background** — the handler was calling Groq *and* Telnyx's speak/transcription APIs before ever returning a response to Telnyx's webhook POST. Split it: return `{"received": true}` instantly, then run the actual LLM call + Telnyx actions in a FastAPI `BackgroundTask`. This stopped Telnyx from timing out and retrying the same event.
+
+- **Added an idempotency guard** — since retries could still slip through, added a `greeted` flag so a duplicate `call.answered` event can't trigger the greeting twice.
+
+- **Cut the LLM's reasoning overhead** — the model (`gpt-oss-120b`) was configured with `reasoning_effort="medium"` and `max_tokens=2048`, generating a lot of hidden "thinking" tokens before the actual one-line reply. Dropped it to `reasoning_effort="low"` and `max_tokens=256`, since a spoken reply only needs 1-3 short sentences.
+
+- **Removed the LLM from the critical first moment entirely** — the opening greeting doesn't need to be dynamically generated. Replaced it with an instant templated string (`"Hi {name}, this is a call about your payment of {amount} due today..."`) that fires the moment the call connects, with zero network/LLM round-trip.
+
+- **Kept the LLM for everything after that** — once the borrower actually starts talking, a short thinking-pause is natural and expected, so the LLM only kicks in from their first reply onward — not for the silence-intolerant moment right after pickup.
+
+- **Net effect:** delay before the agent speaks went from ~16-26 seconds (often ending in a hangup) to near-instant, and mid-call replies got faster too since every turn benefits from the lower reasoning/token settings.
+
+
+
+Here's a realistic breakdown of what to expect now, per stage of the pipeline:
+
+## Opening greeting (right after `call.answered`)
+| Step | Expected latency |
+|---|---|
+| Telnyx → webhook delivery | ~100-500ms (network + ngrok tunnel hop) |
+| Webhook ack response | <50ms (no work done before returning now) |
+| Background task: build templated greeting | ~0ms (pure string formatting, no LLM) |
+| `speak` API call to Telnyx | ~200-800ms (network round trip to Telnyx's API) |
+| Telnyx TTS generates + starts playing audio | ~500ms-1.5s (varies by voice engine) |
+| **Total: borrower hears the first word** | **~1-3 seconds after answering** |
+
+That's a big improvement from the ~16-26s you were seeing — should feel like a normal call connecting, not a dropped/silent line.
+
+## Every turn after that (borrower speaks → agent replies)
+| Step | Expected latency |
+|---|---|
+| Speech → Deepgram transcription, waiting for `is_final` | ~500ms-2s (depends on how the person trails off / pause detection) |
+| Webhook delivery + ack | ~100-500ms |
+| Groq LLM call (`reasoning_effort="low"`, `max_tokens=256`) | ~0.5-2s typically on Groq's fast inference — but this is the one number I can't promise precisely without you measuring it live, since it depends on prompt length (your system prompt + growing conversation history) and current Groq load |
+| `speak` API call + TTS start | ~700ms-2s |
+| **Total: gap between borrower finishing a sentence and agent replying** | **~2-5 seconds, realistically** |
+
+## What "good" looks like for a phone conversation
+- **Under ~2s**: feels natural, like a slightly thoughtful human.
+- **2-4s**: noticeable but tolerable — most people read it as "they're thinking," not "the call broke."
+- **5s+**: starts feeling broken again, risk of the person talking over the agent or hanging up.
+
+**One thing to actually verify rather than assume:** the Groq call duration for mid-conversation turns is the biggest unknown now — it wasn't isolated in your logs (you only saw *completion* timestamps for the greeting flow, which no longer uses Groq at all). I'd suggest placing a real test call and timing borrower-speaks → agent-replies with a stopwatch, or adding a quick `time.monotonic()` log around the `get_graph().invoke(state)` call in `handle_user_turn()` so you have real numbers instead of my estimate. If that number comes back consistently over ~3s, the next lever to pull is switching `CALL_AGENT_MODEL` to a smaller non-reasoning model like `llama-3.1-8b-instant`.
